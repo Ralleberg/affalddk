@@ -788,6 +788,12 @@ class WasteWatchAPI(AffaldDKAPIBase):
             return None, ""
         return int(m.group(1)), (m.group(2) or "").upper()
 
+    def _format_street_name(self, street):
+        street = str(street or "").strip()
+        if not street:
+            return street
+        return " ".join([w[:1].upper() + w[1:] if w else "" for w in street.split()])
+
     async def _tonfor_resolve_canonical_roadname(self, zipcode, street, house_number):
         if self.provider != "tonfor":
             return None
@@ -860,6 +866,7 @@ class WasteWatchAPI(AffaldDKAPIBase):
     async def get_address_list(self, zipcode, street, house_number):
         self.address_list = {}
         street = str(street).strip()
+        street_display = self._format_street_name(street)
         zipcode = str(zipcode).strip()
 
         house_no_int, _house_letter = self._split_house_number(house_number)
@@ -889,7 +896,7 @@ class WasteWatchAPI(AffaldDKAPIBase):
         if not events:
             return []
 
-        display = f"{street} {house_number}, {zipcode}"
+        display = f"{street_display} {house_number}, {zipcode}"
         address_id = f"{road_for_query}|{house_no_int}|{zipcode}"
         self.address_list[display] = address_id
         return [display]
@@ -918,13 +925,19 @@ class WasteWatchAPI(AffaldDKAPIBase):
             if not isinstance(item, dict):
                 continue
 
+            container = (item.get("container") or "").strip()
             raw_date = (item.get("dato") or item.get("date") or "").strip()
-            dato = self._normalize_date(raw_date)
+            dato_iso = self._normalize_date(raw_date)
 
-            normalized_item = dict(item)
-            normalized_item["dato"] = dato
-            normalized_item.setdefault("container", item.get("container", ""))
+            try:
+                pickup_date = dt.datetime.strptime(dato_iso, "%Y-%m-%d").date()
+            except ValueError:
+                continue
 
-            results.append(normalized_item)
+            results.append({
+                "Materiel": container,
+                "Tømningsdag": pickup_date,
+            })
 
+        results.sort(key=lambda x: x["Tømningsdag"])
         return results
