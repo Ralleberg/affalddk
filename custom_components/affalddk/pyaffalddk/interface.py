@@ -6,7 +6,6 @@ import re
 import json
 from urllib.parse import urlparse, parse_qsl, quote
 from bs4 import BeautifulSoup
-from typing import Optional, Tuple
 
 from .const import GH_API
 
@@ -782,14 +781,14 @@ class WasteWatchAPI(AffaldDKAPIBase):
         self.provider = str(self.municipality_id).strip()
         self.url_base = f"https://wastewatch.forsyningonline.dk/prod/{self.provider}"
 
-    def _split_house_number(self, house_number: str) -> Tuple[Optional[int], str]:
+    def _split_house_number(self, house_number):
         text = str(house_number or "").strip()
         m = re.match(r"^(\d+)\s*([A-Za-z]?)", text)
         if not m:
             return None, ""
         return int(m.group(1)), (m.group(2) or "").upper()
 
-    async def _tonfor_resolve_canonical_roadname(self, zipcode: str, street: str, house_number: str) -> Optional[str]:
+    async def _tonfor_resolve_canonical_roadname(self, zipcode, street, house_number):
         if self.provider != "tonfor":
             return None
 
@@ -807,11 +806,29 @@ class WasteWatchAPI(AffaldDKAPIBase):
         }
 
         html = await self.async_get_request(url, para=params, as_json=False)
-        m = re.search(
-            r"wastewatch\\.forsyningonline\\.dk/prod/[^?]+\\?\\$filter=roadName\\s+eq\\s+'([^']+)'\\s+and\\s+houseNumber\\s+eq\\s+\\d+\\s+and\\s+postCode\\s+eq\\s+'\\d{4}'",
-            html,
-            flags=re.IGNORECASE,
-        )
+        if not html:
+            return None
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        href = None
+        for a in soup.find_all("a", href=True):
+            h = a["href"]
+            if "wastewatch.forsyningonline.dk/prod/" in h and "$filter=" in h and "roadName" in h:
+                href = h
+                break
+
+        if not href:
+            m = re.search(r"https://wastewatch\.forsyningonline\.dk/prod/[^\s\"']+", html)
+            if m:
+                href = m.group(0)
+
+        if not href:
+            return None
+
+        href = href.replace("&amp;", "&")
+
+        m = re.search(r"roadName\s+eq\s+'([^']+)'", href, flags=re.IGNORECASE)
         if not m:
             return None
 
@@ -850,6 +867,11 @@ class WasteWatchAPI(AffaldDKAPIBase):
             return []
 
         road_for_query = street
+        if self.provider == "tonfor":
+            canonical_road = await self._tonfor_resolve_canonical_roadname(zipcode, street, house_number)
+            if canonical_road:
+                road_for_query = canonical_road
+
         url = self._build_filtered_url(road_for_query, house_no_int, zipcode)
         data = await self.async_get_request(url, as_json=True)
 
@@ -857,14 +879,12 @@ class WasteWatchAPI(AffaldDKAPIBase):
         if isinstance(data, dict):
             events = data.get("wastewatch") or []
 
-        if not events and self.provider == "tonfor":
-            canonical_road = await self._tonfor_resolve_canonical_roadname(zipcode, street, house_number)
-            if canonical_road:
-                road_for_query = canonical_road
-                url = self._build_filtered_url(road_for_query, house_no_int, zipcode)
-                data = await self.async_get_request(url, as_json=True)
-                if isinstance(data, dict):
-                    events = data.get("wastewatch") or []
+        if not events and self.provider == "tonfor" and road_for_query != street:
+            road_for_query = street
+            url = self._build_filtered_url(road_for_query, house_no_int, zipcode)
+            data = await self.async_get_request(url, as_json=True)
+            if isinstance(data, dict):
+                events = data.get("wastewatch") or []
 
         if not events:
             return []
