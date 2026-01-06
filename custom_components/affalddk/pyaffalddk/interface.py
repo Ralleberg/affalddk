@@ -6,6 +6,7 @@ import re
 import json
 from urllib.parse import urlparse, parse_qsl, quote
 from bs4 import BeautifulSoup
+from typing import Optional, Tuple
 
 from .const import GH_API
 
@@ -781,6 +782,41 @@ class WasteWatchAPI(AffaldDKAPIBase):
         self.provider = str(self.municipality_id).strip()
         self.url_base = f"https://wastewatch.forsyningonline.dk/prod/{self.provider}"
 
+    def _split_house_number(self, house_number: str) -> Tuple[Optional[int], str]:
+        text = str(house_number or "").strip()
+        m = re.match(r"^(\d+)\s*([A-Za-z]?)", text)
+        if not m:
+            return None, ""
+        return int(m.group(1)), (m.group(2) or "").upper()
+
+    async def _tonfor_resolve_canonical_roadname(self, zipcode: str, street: str, house_number: str) -> Optional[str]:
+        if self.provider != "tonfor":
+            return None
+
+        house_no_int, house_letter = self._split_house_number(house_number)
+        if house_no_int is None:
+            return None
+
+        url = "https://www.tonfor.dk/affald/toemmedatoer/dine-toemmedatoer"
+        params = {
+            "postnr": str(zipcode).strip(),
+            "vejnavn": str(street).strip(),
+            "husnummer": str(house_no_int),
+            "bogstav": house_letter,
+            "Lavopslag": "Lav opslag",
+        }
+
+        html = await self.async_get_request(url, para=params, as_json=False)
+        m = re.search(
+            r"wastewatch\\.forsyningonline\\.dk/prod/[^?]+\\?\\$filter=roadName\\s+eq\\s+'([^']+)'\\s+and\\s+houseNumber\\s+eq\\s+\\d+\\s+and\\s+postCode\\s+eq\\s+'\\d{4}'",
+            html,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return None
+
+        return m.group(1).strip()
+
     def _normalize_date(self, date_str: str) -> str:
         """Normalize date to ISO format YYYY-MM-DD."""
         date_str = (date_str or "").strip()
@@ -798,7 +834,6 @@ class WasteWatchAPI(AffaldDKAPIBase):
             return date_str
 
     def _build_filtered_url(self, road: str, house_no_int: int, post_code: str) -> str:
-        """Build WasteWatch OData filter URL."""
         road_escaped = str(road).replace("'", "''")
         return (
             f"{self.url_base}?$filter="
@@ -809,22 +844,33 @@ class WasteWatchAPI(AffaldDKAPIBase):
         self.address_list = {}
         street = str(street).strip()
         zipcode = str(zipcode).strip()
-        m = re.match(r"^(\d+)", str(house_number).strip())
-        if not m:
-            return []
-        house_no_int = int(m.group(1))
 
-        url = self._build_filtered_url(street, house_no_int, zipcode)
+        house_no_int, _house_letter = self._split_house_number(house_number)
+        if house_no_int is None:
+            return []
+
+        road_for_query = street
+        url = self._build_filtered_url(road_for_query, house_no_int, zipcode)
         data = await self.async_get_request(url, as_json=True)
 
         events = []
         if isinstance(data, dict):
             events = data.get("wastewatch") or []
+
+        if not events and self.provider == "tonfor":
+            canonical_road = await self._tonfor_resolve_canonical_roadname(zipcode, street, house_number)
+            if canonical_road:
+                road_for_query = canonical_road
+                url = self._build_filtered_url(road_for_query, house_no_int, zipcode)
+                data = await self.async_get_request(url, as_json=True)
+                if isinstance(data, dict):
+                    events = data.get("wastewatch") or []
+
         if not events:
             return []
 
         display = f"{street} {house_number}, {zipcode}"
-        address_id = f"{street}|{house_no_int}|{zipcode}"
+        address_id = f"{road_for_query}|{house_no_int}|{zipcode}"
         self.address_list[display] = address_id
         return [display]
 
